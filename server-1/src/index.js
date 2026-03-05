@@ -9,12 +9,14 @@ const SERVER_NAME = process.env.SERVER_NAME || 'Server-1';
 app.use(cors());
 app.use(express.json());
 
-// Redis connection (backend also connected to Redis for its own use)
-const redis = new Redis({
-  host: process.env.REDIS_HOST || 'localhost',
-  port: parseInt(process.env.REDIS_PORT) || 6379,
-  retryStrategy: (times) => Math.min(times * 50, 2000),
-});
+// Redis connection — uses REDIS_URL on Railway (includes auth), host/port locally
+const redis = process.env.REDIS_URL
+  ? new Redis(process.env.REDIS_URL, { retryStrategy: (times) => Math.min(times * 50, 2000) })
+  : new Redis({
+      host: process.env.REDIS_HOST || 'localhost',
+      port: parseInt(process.env.REDIS_PORT) || 6379,
+      retryStrategy: (times) => Math.min(times * 50, 2000),
+    });
 redis.on('connect', () => console.log(`[${SERVER_NAME}] Redis connected`));
 
 // Track request count locally (also stored in Redis)
