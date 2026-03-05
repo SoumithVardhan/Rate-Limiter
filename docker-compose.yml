@@ -1,0 +1,88 @@
+name: "rate-limiter-complete"
+
+services:
+
+  # ── Redis ─────────────────────────────────────────────────────────────────
+  redis:
+    container_name: redis-rl
+    image: redis:alpine
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Rate Limiter (Separate Instance) ──────────────────────────────────────
+  rate-limiter:
+    container_name: rate-limiter-svc
+    build:
+      context: ./rate-limiter
+      dockerfile: Dockerfile
+    ports:
+      - "4000:4000"
+    environment:
+      - PORT=4000
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - SERVER_1_URL=http://server-1:5001
+      - SERVER_2_URL=http://server-2:5002
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Backend Server 1 ──────────────────────────────────────────────────────
+  server-1:
+    container_name: backend-server-1
+    build:
+      context: ./server-1
+      dockerfile: Dockerfile
+    ports:
+      - "5001:5001"
+    environment:
+      - PORT=5001
+      - SERVER_NAME=Server-1
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Backend Server 2 ──────────────────────────────────────────────────────
+  server-2:
+    container_name: backend-server-2
+    build:
+      context: ./server-2
+      dockerfile: Dockerfile
+    ports:
+      - "5002:5002"
+    environment:
+      - PORT=5002
+      - SERVER_NAME=Server-2
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Frontend (React + Vite → nginx) ─────────────────────────────────────
+  frontend:
+    container_name: rl-frontend
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      - rate-limiter
+    restart: unless-stopped
+
+volumes:
+  redis-data:
