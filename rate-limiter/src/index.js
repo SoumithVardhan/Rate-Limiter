@@ -10,10 +10,23 @@ const slidingWindowCounter = require('./algorithms/slidingWindowCounter');
 const app  = express();
 const PORT = process.env.PORT || 4000;
 
-// Backend server URLs (injected via docker-compose env vars)
+// ── Trust the reverse proxy (Railway / AWS ALB / nginx / Cloudflare etc.)
+// Without this, req.ip returns the proxy's internal IP (same for ALL users),
+// which causes everyone to share one rate-limit bucket → requests get blocked
+// way sooner than expected.
+app.set('trust proxy', true);
+
+// ── Backend server config ────────────────────────────────────────────────────
+// Works on ANY platform — set these env vars in Railway / AWS / Azure / .env
 const SERVERS = [
-  process.env.SERVER_1_URL || 'http://localhost:5001',
-  process.env.SERVER_2_URL || 'http://localhost:5002',
+  {
+    url:  process.env.SERVER_1_URL  || 'http://localhost:5001',
+    name: process.env.SERVER_1_NAME || 'Server-1',
+  },
+  {
+    url:  process.env.SERVER_2_URL  || 'http://localhost:5002',
+    name: process.env.SERVER_2_NAME || 'Server-2',
+  },
 ];
 
 // Round-robin index — alternates between Server-1 and Server-2
@@ -31,10 +44,20 @@ app.use(cors());
 app.use(express.json());
 
 // ── Helper: get client ID ────────────────────────────────────────────────────
+// Priority order:
+//   1. Explicit header from client (most reliable for demos)
+//   2. Real IP from x-forwarded-for (set by Railway/nginx/Cloudflare)
+//   3. req.ip — works correctly only after `app.set('trust proxy', true)`
+//   4. Fallback
 function getClientId(req) {
+  // x-forwarded-for may be "client-ip, proxy1-ip, proxy2-ip"
+  // The FIRST entry is always the real client IP
+  const forwarded = req.headers['x-forwarded-for'];
+  const realIp = forwarded ? forwarded.split(',')[0].trim() : null;
+
   return (
     req.headers['x-client-id'] ||
-    req.headers['x-forwarded-for']?.split(',')[0].trim() ||
+    realIp ||
     req.ip ||
     'anonymous'
   );
@@ -42,14 +65,30 @@ function getClientId(req) {
 
 // ── Helper: pick next backend server (round-robin) ───────────────────────────
 function getNextServer() {
-  const url = SERVERS[serverIndex % SERVERS.length];
+  const server = SERVERS[serverIndex % SERVERS.length];
   serverIndex++;
-  return url;
+  return server; // returns { url, name }
+}
+
+// ── Helper: fetch with timeout (AbortController) ─────────────────────────────
+async function fetchWithTimeout(url, options = {}, timeoutMs = 5000) {
+  const { default: fetch } = await import('node-fetch');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ── Health check ─────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'rate-limiter', servers: SERVERS });
+  res.json({
+    status:  'ok',
+    service: 'rate-limiter',
+    servers: SERVERS.map(s => ({ name: s.name, url: s.url })),
+  });
 });
 
 // ── POST /request — Single request through rate limiter ──────────────────────
@@ -80,30 +119,36 @@ app.post('/request', async (req, res) => {
         limit:      result.limit,
         retryAfter: result.retryAfter,
         algorithm,
+        clientId,
         message:    'Rate limit exceeded. Try again later.',
       });
     }
 
     // Step 3: ALLOWED — forward request to next backend server (round-robin)
-    const serverUrl  = getNextServer();
-    const serverName = serverUrl.includes('5001') ? 'Server-1' : 'Server-2';
+    const { url: serverUrl, name: serverName } = getNextServer();
 
-    const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
-    const backendRes = await fetch(`${serverUrl}/api/data`, {
-      method: 'GET',
-      headers: { 'X-Forwarded-Client': clientId },
-    });
-    const backendData = await backendRes.json();
+    let backendData = null;
+    try {
+      const backendRes = await fetchWithTimeout(`${serverUrl}/api/data`, {
+        method:  'GET',
+        headers: { 'X-Forwarded-Client': clientId },
+      }, 5000);
+      backendData = await backendRes.json();
+    } catch (backendErr) {
+      console.warn(`[Rate Limiter] Backend ${serverName} unreachable: ${backendErr.message}`);
+      backendData = { error: 'Backend unreachable', server: serverName };
+    }
 
     // Step 4: Return combined result to frontend
     return res.json({
-      allowed:    true,
-      remaining:  result.remaining,
-      limit:      result.limit,
+      allowed:   true,
+      remaining: result.remaining,
+      limit:     result.limit,
       algorithm,
-      server:     serverName,
+      server:    serverName,
       serverUrl,
-      data:       backendData,
+      clientId,
+      data:      backendData,
     });
 
   } catch (err) {
@@ -121,7 +166,7 @@ app.post('/burst', async (req, res) => {
 
   if (!algo) return res.status(400).json({ error: `Unknown algorithm: ${algorithm}` });
 
-  const results = [];
+  const results  = [];
   const safeCount = Math.min(Math.max(parseInt(count) || 10, 1), 50);
 
   for (let i = 0; i < safeCount; i++) {
@@ -130,7 +175,7 @@ app.post('/burst', async (req, res) => {
 
       if (!result.allowed) {
         results.push({
-          index: i + 1,
+          index:      i + 1,
           allowed:    false,
           remaining:  result.remaining,
           limit:      result.limit,
@@ -140,15 +185,13 @@ app.post('/burst', async (req, res) => {
         continue;
       }
 
-      const serverUrl  = getNextServer();
-      const serverName = serverUrl.includes('5001') ? 'Server-1' : 'Server-2';
-      const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+      const { url: serverUrl, name: serverName } = getNextServer();
 
       try {
-        const backendRes  = await fetch(`${serverUrl}/api/data`);
+        const backendRes  = await fetchWithTimeout(`${serverUrl}/api/data`, {}, 5000);
         const backendData = await backendRes.json();
         results.push({
-          index: i + 1,
+          index:     i + 1,
           allowed:   true,
           remaining: result.remaining,
           limit:     result.limit,
@@ -157,7 +200,13 @@ app.post('/burst', async (req, res) => {
           data:      backendData,
         });
       } catch {
-        results.push({ index: i + 1, allowed: true, remaining: result.remaining, server: serverName, error: 'Backend unreachable' });
+        results.push({
+          index:     i + 1,
+          allowed:   true,
+          remaining: result.remaining,
+          server:    serverName,
+          error:     'Backend unreachable',
+        });
       }
     } catch (err) {
       results.push({ index: i + 1, error: err.message });
@@ -185,6 +234,7 @@ app.listen(PORT, () => {
   console.log(`\n  ╔══════════════════════════════════════╗`);
   console.log(`  ║   Rate Limiter Service — Port ${PORT}   ║`);
   console.log(`  ╚══════════════════════════════════════╝`);
-  console.log(`  Backends: ${SERVERS.join(' | ')}`);
-  console.log(`  Redis:    ${process.env.REDIS_HOST || 'localhost'}:${process.env.REDIS_PORT || 6379}\n`);
+  console.log(`  Backends:`);
+  SERVERS.forEach(s => console.log(`    • ${s.name}: ${s.url}`));
+  console.log(`  Redis: ${process.env.REDIS_URL || `${process.env.REDIS_HOST || 'localhost'}:${process.env.REDIS_PORT || 6379}`}\n`);
 });

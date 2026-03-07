@@ -1,5 +1,8 @@
 name: "rate-limiter-complete"
 
+# Docker Compose reads .env in this directory automatically.
+# Copy .env.example → .env before running `docker compose up`.
+
 services:
 
   # ── Redis ─────────────────────────────────────────────────────────────────
@@ -17,20 +20,23 @@ services:
       timeout: 3s
       retries: 5
 
-  # ── Rate Limiter (Separate Instance) ──────────────────────────────────────
+  # ── Rate Limiter ──────────────────────────────────────────────────────────
   rate-limiter:
     container_name: rate-limiter-svc
     build:
       context: ./rate-limiter
       dockerfile: Dockerfile
     ports:
-      - "4000:4000"
+      - "${RATE_LIMITER_PORT:-4000}:4000"
     environment:
       - PORT=4000
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - SERVER_1_URL=http://server-1:5001
-      - SERVER_2_URL=http://server-2:5002
+      # Internal Docker network URLs — services talk to each other by container name
+      - SERVER_1_URL=http://server-1:${SERVER_1_PORT:-5001}
+      - SERVER_1_NAME=${SERVER_1_NAME:-Server-1}
+      - SERVER_2_URL=http://server-2:${SERVER_2_PORT:-5002}
+      - SERVER_2_NAME=${SERVER_2_NAME:-Server-2}
     depends_on:
       redis:
         condition: service_healthy
@@ -43,10 +49,10 @@ services:
       context: ./server-1
       dockerfile: Dockerfile
     ports:
-      - "5001:5001"
+      - "${SERVER_1_PORT:-5001}:5001"
     environment:
       - PORT=5001
-      - SERVER_NAME=Server-1
+      - SERVER_NAME=${SERVER_1_NAME:-Server-1}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
     depends_on:
@@ -61,10 +67,10 @@ services:
       context: ./server-2
       dockerfile: Dockerfile
     ports:
-      - "5002:5002"
+      - "${SERVER_2_PORT:-5002}:5002"
     environment:
       - PORT=5002
-      - SERVER_NAME=Server-2
+      - SERVER_NAME=${SERVER_2_NAME:-Server-2}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
     depends_on:
@@ -72,14 +78,18 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # ── Frontend (React + Vite → nginx) ─────────────────────────────────────
+  # ── Frontend (React + Vite → nginx) ──────────────────────────────────────
   frontend:
     container_name: rl-frontend
     build:
       context: ./frontend
       dockerfile: Dockerfile
     ports:
-      - "3000:80"
+      - "${FRONTEND_PORT:-3000}:80"
+    environment:
+      # nginx.conf uses this to proxy /request /burst /reset /health
+      # Uses Docker internal network — do NOT change to localhost
+      - RATE_LIMITER_URL=http://rate-limiter:4000
     depends_on:
       - rate-limiter
     restart: unless-stopped
