@@ -12,12 +12,10 @@ const PORT = process.env.PORT || 4000;
 
 // ── Trust the reverse proxy (Railway / AWS ALB / nginx / Cloudflare etc.)
 // Without this, req.ip returns the proxy's internal IP (same for ALL users),
-// which causes everyone to share one rate-limit bucket → requests get blocked
-// way sooner than expected.
+// which causes everyone to share one rate-limit bucket.
 app.set('trust proxy', true);
 
 // ── Backend server config ────────────────────────────────────────────────────
-// Works on ANY platform — set these env vars in Railway / AWS / Azure / .env
 const SERVERS = [
   {
     url:  process.env.SERVER_1_URL  || 'http://localhost:5001',
@@ -29,7 +27,7 @@ const SERVERS = [
   },
 ];
 
-// Round-robin index — alternates between Server-1 and Server-2
+// Round-robin index
 let serverIndex = 0;
 
 // Algorithm registry
@@ -43,34 +41,29 @@ const ALGORITHMS = {
 app.use(cors());
 app.use(express.json());
 
+// ── Helper: sanitize error message before sending to client ──────────────────
+// Never send raw err.message to the client — it can contain Redis URLs with
+// passwords, internal hostnames, or stack traces.
+function safeError(err, fallback = 'Internal server error') {
+  console.error('[Rate Limiter]', err.message); // full detail stays server-side only
+  return fallback;
+}
+
 // ── Helper: get client ID ────────────────────────────────────────────────────
-// Priority order:
-//   1. Explicit header from client (most reliable for demos)
-//   2. Real IP from x-forwarded-for (set by Railway/nginx/Cloudflare)
-//   3. req.ip — works correctly only after `app.set('trust proxy', true)`
-//   4. Fallback
 function getClientId(req) {
-  // x-forwarded-for may be "client-ip, proxy1-ip, proxy2-ip"
-  // The FIRST entry is always the real client IP
   const forwarded = req.headers['x-forwarded-for'];
   const realIp = forwarded ? forwarded.split(',')[0].trim() : null;
-
-  return (
-    req.headers['x-client-id'] ||
-    realIp ||
-    req.ip ||
-    'anonymous'
-  );
+  return req.headers['x-client-id'] || realIp || req.ip || 'anonymous';
 }
 
 // ── Helper: pick next backend server (round-robin) ───────────────────────────
 function getNextServer() {
   const server = SERVERS[serverIndex % SERVERS.length];
   serverIndex++;
-  return server; // returns { url, name }
+  return server;
 }
 
-// ── Helper: fetch with timeout (AbortController) ─────────────────────────────
+// ── Helper: fetch with timeout ────────────────────────────────────────────────
 async function fetchWithTimeout(url, options = {}, timeoutMs = 5000) {
   const { default: fetch } = await import('node-fetch');
   const controller = new AbortController();
@@ -82,17 +75,17 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 5000) {
   }
 }
 
-// ── Health check ─────────────────────────────────────────────────────────────
+// ── Health check ──────────────────────────────────────────────────────────────
+// Returns service status and server NAMES only — never internal URLs or credentials.
 app.get('/health', (req, res) => {
   res.json({
     status:  'ok',
     service: 'rate-limiter',
-    servers: SERVERS.map(s => ({ name: s.name, url: s.url })),
+    servers: SERVERS.map(s => s.name), // name only — no internal URLs exposed
   });
 });
 
-// ── POST /request — Single request through rate limiter ──────────────────────
-// Frontend calls this. Rate limiter checks Redis, then proxies to backend.
+// ── POST /request ─────────────────────────────────────────────────────────────
 app.post('/request', async (req, res) => {
   const { algorithm = 'sliding-window-counter', config = {} } = req.body;
   const clientId = getClientId(req);
@@ -103,15 +96,12 @@ app.post('/request', async (req, res) => {
   }
 
   try {
-    // Step 1: Check rate limit using Redis
     const result = await algo.attempt(clientId, config);
 
-    // Step 2: Set rate limit response headers
     res.setHeader('X-RateLimit-Limit',     result.limit);
     res.setHeader('X-RateLimit-Remaining', result.remaining);
 
     if (!result.allowed) {
-      // BLOCKED — return 429, do NOT forward to backend
       res.setHeader('Retry-After', result.retryAfter || 60);
       return res.status(429).json({
         allowed:    false,
@@ -124,7 +114,6 @@ app.post('/request', async (req, res) => {
       });
     }
 
-    // Step 3: ALLOWED — forward request to next backend server (round-robin)
     const { url: serverUrl, name: serverName } = getNextServer();
 
     let backendData = null;
@@ -139,26 +128,23 @@ app.post('/request', async (req, res) => {
       backendData = { error: 'Backend unreachable', server: serverName };
     }
 
-    // Step 4: Return combined result to frontend
     return res.json({
       allowed:   true,
       remaining: result.remaining,
       limit:     result.limit,
       algorithm,
-      server:    serverName,
-      serverUrl,
+      server:    serverName,  // name only — internal URL never sent to browser
       clientId,
       data:      backendData,
     });
 
   } catch (err) {
-    console.error('[Rate Limiter] Error:', err.message);
-    // Fail open — allow request if something breaks
-    return res.status(500).json({ error: 'Rate limiter error', detail: err.message });
+    const msg = safeError(err, 'Rate limiter error. Please try again.');
+    return res.status(500).json({ error: msg });
   }
 });
 
-// ── POST /burst — Send N requests in rapid succession ────────────────────────
+// ── POST /burst ───────────────────────────────────────────────────────────────
 app.post('/burst', async (req, res) => {
   const { algorithm = 'sliding-window-counter', config = {}, count = 10 } = req.body;
   const clientId = getClientId(req);
@@ -166,7 +152,7 @@ app.post('/burst', async (req, res) => {
 
   if (!algo) return res.status(400).json({ error: `Unknown algorithm: ${algorithm}` });
 
-  const results  = [];
+  const results   = [];
   const safeCount = Math.min(Math.max(parseInt(count) || 10, 1), 50);
 
   for (let i = 0; i < safeCount; i++) {
@@ -209,32 +195,39 @@ app.post('/burst', async (req, res) => {
         });
       }
     } catch (err) {
-      results.push({ index: i + 1, error: err.message });
+      // Log full error server-side, send generic message to client
+      safeError(err, 'Request processing error');
+      results.push({ index: i + 1, error: 'Request processing error' });
     }
   }
 
   res.json(results);
 });
 
-// ── POST /reset — Clear rate limit counters for a client ─────────────────────
+// ── POST /reset ───────────────────────────────────────────────────────────────
 app.post('/reset', async (req, res) => {
   const clientId = getClientId(req);
-
   try {
     const keys = await redis.keys(`rl:*:${clientId}*`);
     if (keys.length > 0) await redis.del(...keys);
     res.json({ ok: true, cleared: keys.length, clientId });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    const msg = safeError(err, 'Failed to reset counters');
+    res.status(500).json({ error: msg });
   }
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
+  // Log Redis host only — never log REDIS_URL which contains the password
+  const redisHost = process.env.REDIS_URL
+    ? process.env.REDIS_URL.replace(/:\/\/[^@]+@/, '://***:***@') // mask credentials
+    : `${process.env.REDIS_HOST || 'localhost'}:${process.env.REDIS_PORT || 6379}`;
+
   console.log(`\n  ╔══════════════════════════════════════╗`);
   console.log(`  ║   Rate Limiter Service — Port ${PORT}   ║`);
   console.log(`  ╚══════════════════════════════════════╝`);
   console.log(`  Backends:`);
   SERVERS.forEach(s => console.log(`    • ${s.name}: ${s.url}`));
-  console.log(`  Redis: ${process.env.REDIS_URL || `${process.env.REDIS_HOST || 'localhost'}:${process.env.REDIS_PORT || 6379}`}\n`);
+  console.log(`  Redis: ${redisHost}\n`);
 });
