@@ -25,6 +25,10 @@ ENV RATE_LIMITER_URL=http://rate-limiter:4000
 
 EXPOSE 80
 
-# Substitute RATE_LIMITER_URL into nginx.conf at container start, then launch nginx.
-# This means you can change the URL without rebuilding the image — just set the env var.
-CMD ["/bin/sh", "-c", "envsubst '${RATE_LIMITER_URL}' < /etc/nginx/conf.d/default.conf.template > /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'"]
+# At container start:
+#   1. Read the real DNS nameserver from /etc/resolv.conf (works on any platform).
+#   2. Substitute both RATE_LIMITER_URL and DNS_RESOLVER into nginx.conf.
+#   3. Launch nginx.
+# This lets you change the upstream URL without rebuilding the image, and ensures
+# nginx uses the platform's actual DNS so it re-resolves hostnames dynamically.
+CMD ["/bin/sh", "-c", "DNS_RESOLVER=$(grep nameserver /etc/resolv.conf | head -1 | awk '{print $2}') && export DNS_RESOLVER && envsubst '${RATE_LIMITER_URL} ${DNS_RESOLVER}' < /etc/nginx/conf.d/default.conf.template > /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'"]
