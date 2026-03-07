@@ -31,4 +31,4 @@ EXPOSE 80
 #   3. Launch nginx.
 # This lets you change the upstream URL without rebuilding the image, and ensures
 # nginx uses the platform's actual DNS so it re-resolves hostnames dynamically.
-CMD ["/bin/sh", "-c", "DNS_RESOLVER=$(grep nameserver /etc/resolv.conf | head -1 | awk '{print $2}') && export DNS_RESOLVER && envsubst '${RATE_LIMITER_URL} ${DNS_RESOLVER}' < /etc/nginx/conf.d/default.conf.template > /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'"]
+CMD ["/bin/sh", "-c", "DNS_IP=$(grep -m1 '^nameserver' /etc/resolv.conf | awk '{print $2}') && if echo \"$DNS_IP\" | grep -q ':'; then DNS_RESOLVER=\"[$DNS_IP]\"; else DNS_RESOLVER=\"$DNS_IP\"; fi && export DNS_RESOLVER && envsubst '${RATE_LIMITER_URL} ${DNS_RESOLVER}' < /etc/nginx/conf.d/default.conf.template > /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'"]
